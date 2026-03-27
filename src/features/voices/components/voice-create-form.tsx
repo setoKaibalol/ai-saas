@@ -1,11 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { z } from "zod";
 import { toast } from "sonner";
 import { useForm } from "@tanstack/react-form";
 import { useDropzone } from "react-dropzone";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+
+import { convertToWav } from "@/lib/audio-to-wav";
 import {
   AudioLines,
   FolderOpen,
@@ -91,26 +93,55 @@ function FileDropzone({
   onFileChange: (file: File | null) => void;
   isInvalid?: boolean;
 }) {
+  const [isConverting, setIsConverting] = useState(false);
   const { isPlaying, togglePlay } = useAudioPlayback(file);
+
+  const handleFile = useCallback(async (raw: File) => {
+    if (raw.type === "audio/wav" || raw.type === "audio/wave") {
+      onFileChange(raw);
+      return;
+    }
+
+    setIsConverting(true);
+    try {
+      const wav = await convertToWav(raw);
+      onFileChange(wav);
+    } catch {
+      toast.error("Could not convert this file. Please upload a WAV or MP3.");
+    } finally {
+      setIsConverting(false);
+    }
+  }, [onFileChange]);
 
   const {
     getRootProps, getInputProps, isDragActive, isDragReject
   } = useDropzone({
-    accept: { "audio/*": [] },
+    accept: { "audio/*": [], "video/mp4": [] },
     maxSize: 20 * 1024 * 1024,
     multiple: false,
+    disabled: isConverting,
     onDrop: (acceptedFiles) => {
       if (acceptedFiles.length > 0) {
-        onFileChange(acceptedFiles[0]);
+        handleFile(acceptedFiles[0]);
+      }
+    },
+    onDropRejected: (rejections) => {
+      const error = rejections[0]?.errors[0];
+      if (error?.code === "file-too-large") {
+        toast.error("File exceeds the 20 MB size limit");
+      } else if (error?.code === "file-invalid-type") {
+        toast.error("Unsupported file type. Please upload an audio file.");
+      } else {
+        toast.error(error?.message ?? "File could not be uploaded");
       }
     },
   });
 
   if (file) {
     return (
-      <div className="flex items-center gap-3 rounded-xl border p-4">
+      <div className="flex items-center gap-3 overflow-hidden rounded-xl border p-4">
 
-        <div className="flex size-10 items-center justify-center rounded-lg bg-muted">
+        <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-muted">
           <FileAudio className="size-5 text-muted-foreground" />
         </div>
 
@@ -125,6 +156,7 @@ function FileDropzone({
           type="button"
           variant="ghost"
           size="icon-sm"
+          className="shrink-0"
           onClick={togglePlay}
         >
           {isPlaying ? (
@@ -137,10 +169,29 @@ function FileDropzone({
           type="button"
           variant="ghost"
           size="icon-sm"
+          className="shrink-0"
           onClick={() => onFileChange(null)}
         >
           <X className="size-4" />
         </Button>
+      </div>
+    );
+  }
+
+  if (isConverting) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-4 overflow-hidden rounded-2xl border px-6 py-10">
+        <div className="flex size-12 items-center justify-center rounded-xl bg-muted">
+          <AudioLines className="size-5 text-muted-foreground animate-pulse" />
+        </div>
+        <div className="flex flex-col items-center gap-1.5">
+          <p className="text-base font-semibold tracking-tight">
+            Converting to WAV...
+          </p>
+          <p className="text-center text-sm text-muted-foreground">
+            This usually takes a few seconds
+          </p>
+        </div>
       </div>
     );
   }
@@ -168,7 +219,7 @@ function FileDropzone({
         </p>
 
         <p className="text-center text-sm text-muted-foreground">
-          Supports all audio formats, max size 20MB
+          Supports all audio formats &amp; MP4, max size 20MB
         </p>
       </div>
 

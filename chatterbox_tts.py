@@ -19,19 +19,14 @@ import modal
 #   -d '{"prompt": "Hello from Chatterbox [chuckle].", "voice_key": "voices/system/<voice-id>"}' \
 #   --output output.wav
 
-# R2 cloud bucket mount (read-only, replaces Modal Volume)
-R2_BUCKET_NAME = "<bucket-name>"
-R2_ACCOUNT_ID = "<account-id>"
-R2_MOUNT_PATH = "/r2"
-r2_bucket = modal.CloudBucketMount(
-    R2_BUCKET_NAME,
-    bucket_endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
-    secret=modal.Secret.from_name("cloudflare-r2"),
-    read_only=True,
-)
+R2_BUCKET_NAME = "ai-b2b"
+R2_ACCOUNT_ID = "b03567b2897469e1aabf085582293f23"
+R2_ENDPOINT = f"https://{R2_ACCOUNT_ID}.eu.r2.cloudflarestorage.com"
+VOICE_CACHE_DIR = "/tmp/voice-cache"
 
 # Modal setup
 image = modal.Image.debian_slim(python_version="3.10").uv_pip_install(
+    "boto3",
     "chatterbox-tts==0.1.6",
     "fastapi[standard]==0.124.4",
     "peft==0.18.0",
@@ -43,6 +38,7 @@ with image.imports():
     import os
     from pathlib import Path
 
+    import boto3
     import torchaudio as ta
     from chatterbox.tts_turbo import ChatterboxTurboTTS
     from fastapi import (
@@ -88,13 +84,29 @@ with image.imports():
         modal.Secret.from_name("chatterbox-api-key"),
         modal.Secret.from_name("cloudflare-r2"),
     ],
-    volumes={R2_MOUNT_PATH: r2_bucket},
 )
 @modal.concurrent(max_inputs=10)
 class Chatterbox:
     @modal.enter()
     def load_model(self):
         self.model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+        self.s3 = boto3.client(
+            "s3",
+            region_name="auto",
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        )
+        Path(VOICE_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+
+    def _fetch_voice(self, voice_key: str) -> str:
+        """Download a voice file from R2 and cache it locally."""
+        safe_name = voice_key.replace("/", "__")
+        local_path = Path(VOICE_CACHE_DIR) / safe_name
+        if local_path.exists():
+            return str(local_path)
+        self.s3.download_file(R2_BUCKET_NAME, voice_key, str(local_path))
+        return str(local_path)
 
     @modal.asgi_app()
     def serve(self):
@@ -114,8 +126,9 @@ class Chatterbox:
 
         @web_app.post("/generate", responses={200: {"content": {"audio/wav": {}}}})
         def generate_speech(request: TTSRequest):
-            voice_path = Path(R2_MOUNT_PATH) / request.voice_key
-            if not voice_path.exists():
+            try:
+                voice_path = self._fetch_voice(request.voice_key)
+            except Exception:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Voice not found at '{request.voice_key}'",
@@ -124,7 +137,7 @@ class Chatterbox:
             try:
                 audio_bytes = self.generate.local(
                     request.prompt,
-                    str(voice_path),
+                    voice_path,
                     request.temperature,
                     request.top_p,
                     request.top_k,
@@ -184,10 +197,9 @@ def test(
     import pathlib
 
     chatterbox = Chatterbox()
-    audio_prompt_path = f"{R2_MOUNT_PATH}/{voice_key}"
     audio_bytes = chatterbox.generate.remote(
         prompt=prompt,
-        audio_prompt_path=audio_prompt_path,
+        audio_prompt_path=voice_key,
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
